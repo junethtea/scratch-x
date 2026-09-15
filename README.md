@@ -300,7 +300,8 @@ This keeps a previously selected save location from becoming an accidental desti
 
 Scratch-X uses a compact floating window so it can remain open while the user works on the QGIS map canvas.
 
-<img width="645" height="926" alt="image" src="https://github.com/user-attachments/assets/7a53599a-fb81-4e0a-9e31-612250357753" />
+<img width="640" height="922" alt="image" src="https://github.com/user-attachments/assets/2fc21c97-2bd2-4218-a74c-5671071de87e" />
+
 
 *Scratch-X main interface — a compact floating workspace for fast geometry creation, styling, measurement, and saving.*
 

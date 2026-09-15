@@ -2,12 +2,12 @@
 name=Scratch-X
 qgisMinimumVersion=3.34
 qgisMaximumVersion=4.2
-version=2.1.1
+version=2.1.2
 author=Jujun Junaedi
 email=jujun.junaedi@outlook.com
 description=Fast and flexible scratch geometry tool for QGIS
-about=Create Line, Point, Polygon and customizable Shapes directly on the QGIS map canvas. Dynamic line distance, cumulative measurement, categorized point symbols, custom styling, bilingual interface, and saving to SHP, TAB, KML or GeoJSON.
-tracker=https://github.com/junethtea/scratch-x
+about=Scratch-X is a free QGIS plugin for quickly creating Line, LineString routes, Point, Polygon, and customizable Shapes directly on the QGIS map canvas, with live measurements, flexible styling, categorized symbols, and multiple export formats.
+tracker=https://github.com/junethtea/scratch-x/issues
 repository=https://github.com/junethtea/scratch-x
 hasProcessingProvider=no
 tags=scratch,layer,digitize,draw,geometry,shape,gis,telecom

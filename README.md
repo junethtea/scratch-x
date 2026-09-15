@@ -4,7 +4,7 @@
 
 Scratch-X is a free QGIS plugin for quickly creating **Line, LineString routes, Point, Polygon, and customizable Shapes** directly on the QGIS map canvas, with live measurements, flexible styling, categorized symbols, and multiple export formats.
 
-> **Current version: 2.1.1**
+> **Current version: 2.1.2**
 
 ---
 

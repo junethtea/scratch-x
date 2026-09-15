@@ -30,7 +30,8 @@ from qgis.core import (
     QgsVectorFileWriter, QgsSimpleMarkerSymbolLayer,
     QgsMarkerSymbol, QgsSvgMarkerSymbolLayer, QgsLineSymbol, QgsFillSymbol,
     QgsSingleSymbolRenderer, QgsFeature, QgsGeometry,
-    QgsPointXY, QgsWkbTypes, QgsEditFormConfig, QgsDistanceArea, QgsCoordinateReferenceSystem, QgsCoordinateTransform
+    QgsPointXY, QgsWkbTypes, QgsEditFormConfig, QgsDistanceArea, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsMessageLog, Qgis
 )
 from qgis.gui import QgsMapTool, QgsRubberBand
 
@@ -108,6 +109,15 @@ for _cat, _items in SYMBOL_CATEGORIES.items():
         ALL_SYMBOLS.append((_sid, _en, _id, _cat))
 
 # QGIS simple-marker mapping where an exact marker exists.
+def _sx_log_warning(message):
+    """Write a non-intrusive warning to the QGIS Message Log."""
+    try:
+        QgsMessageLog.logMessage(str(message), "Scratch-X", Qgis.Warning, False)
+    except Exception:
+        # Logging must never interfere with the plugin's normal operation.
+        return
+
+
 SIMPLE_MARKERS = {
     "circle": "Circle", "square": "Square", "diamond": "Diamond",
     "tri_u": "Triangle", "penta": "Pentagon", "hexa": "Hexagon",
@@ -115,15 +125,6 @@ SIMPLE_MARKERS = {
     "cross_x": "Cross2", "arrow": "Arrow", "heart": "Heart",
     "semi": "SemiCircle",
 }
-
-LINE_STYLES = [
-    ("solid", "Solid", Qt.SolidLine, "solid", []),
-    ("dash", "Dash", Qt.DashLine, "dash", [6, 3]),
-    ("dot", "Dot", Qt.DotLine, "dot", [1, 3]),
-    ("dashdot", "Dash-Dot", Qt.DashDotLine, "dash dot", [6, 2, 1, 2]),
-    ("dashdotdot", "Dash-Dot-Dot", Qt.DashDotDotLine, "dash dot dot", [6, 2, 1, 2, 1, 2]),
-    ("longdash", "Long Dash", Qt.DashLine, "dash", [12, 4]),
-]
 
 SHAPES = [
     ("circle", "Circle", "Lingkaran"), ("square", "Square", "Kotak"),
@@ -234,6 +235,17 @@ else:
     QSTYLE_DIR_OPEN = QStyle.SP_DirOpenIcon
     QPAINTER_ANTIALIASING = QPainter.Antialiasing
 
+
+# Line styles are defined after the Qt5/Qt6 compatibility layer so that
+# QGIS 4 / Qt6 never evaluates legacy Qt.* pen-style enums at import time.
+LINE_STYLES = [
+    ("solid", "Solid", QT_SOLID, "solid", []),
+    ("dash", "Dash", QT_DASH, "dash", [6, 3]),
+    ("dot", "Dot", QT_DOT, "dot", [1, 3]),
+    ("dashdot", "Dash-Dot", QT_DASHDOT, "dash dot", [6, 2, 1, 2]),
+    ("dashdotdot", "Dash-Dot-Dot", QT_DASHDOTDOT, "dash dot dot", [6, 2, 1, 2, 1, 2]),
+    ("longdash", "Long Dash", QT_DASH, "dash", [12, 4]),
+]
 
 def _qcolor_alpha(c, alpha):
     out = QColor(c)
@@ -429,8 +441,8 @@ def _custom_color_dialog(parent, initial, title):
                     f"QPushButton{{background:{CARD};color:#FFFFFF !important;border:1px solid {BORDER};border-radius:5px;padding:5px 10px;}}"
                     f"QPushButton:hover{{background:{HOV};color:#FFFFFF !important;border-color:{PRI};}}"
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        _sx_log_warning(f"Unable to style QColorDialog buttons: {e}")
     return dlg.selectedColor() if dlg.exec() else QColor()
 
 
@@ -635,10 +647,7 @@ class ScratchXLineMapTool(QgsMapTool):
             self._cancel_route()
             event.accept()
             return
-        try:
-            super().keyPressEvent(event)
-        except Exception:
-            pass
+        super().keyPressEvent(event)
 
     def _same_point(self, a, b):
         return abs(a.x() - b.x()) < 1e-12 and abs(a.y() - b.y()) < 1e-12
@@ -763,10 +772,7 @@ class ScratchXShapeMapTool(QgsMapTool):
             self._cancel()
             event.accept()
             return
-        try:
-            super().keyPressEvent(event)
-        except Exception:
-            pass
+        super().keyPressEvent(event)
 
     def _show_measure(self, pt, screen_pos):
         if self.shape_type == "circle" and self.anchor is not None:
@@ -911,8 +917,7 @@ class ScratchXPolygonMapTool(QgsMapTool):
         pt=self.toMapCoordinates(event.pos()); pts=self.points+[pt]; self._draw(pts); self._show_measure(event.pos(),pts)
     def keyPressEvent(self,event):
         if event.key()==QT_ESC:self._cancel();event.accept();return
-        try:super().keyPressEvent(event)
-        except Exception:pass
+        super().keyPressEvent(event)
     def _same(self,a,b):return abs(a.x()-b.x())<1e-12 and abs(a.y()-b.y())<1e-12
     def _area(self,pts):
         if len(pts)<3:return 0.0
@@ -1091,7 +1096,7 @@ class AboutDialog(QDialog):
 
 
 class ScratchXDialog(QDialog):
-    VERSION="2.1.1"
+    VERSION="2.1.2"
     SETTINGS_ORG="ScratchX"
     SETTINGS_APP="ScratchX"
     def __init__(self,iface,parent=None):
@@ -1111,8 +1116,8 @@ class ScratchXDialog(QDialog):
         super().showEvent(event)
         try:
             self._position_tool_window()
-        except Exception:
-            pass
+        except Exception as e:
+            _sx_log_warning(f"Unable to position Scratch-X window: {e}")
 
     def tr(self,en,idn):return en if self.lang=="en" else idn
     def _apply_theme(self):
@@ -1145,8 +1150,8 @@ class ScratchXDialog(QDialog):
             y=min(y,ag.bottom()-self.height()-margin)
             y=max(ag.top()+margin,y)
             self.move(max(ag.left()+margin,x),y)
-        except Exception:
-            pass
+        except Exception as e:
+            _sx_log_warning(f"Unable to position Scratch-X window: {e}")
     def _mkTitle(self):
         bar=QWidget();bar.setFixedHeight(46);bar.setStyleSheet(f"background:{PANEL};border-bottom:1px solid {BORDER};");l=QHBoxLayout(bar);l.setContentsMargins(12,0,10,0);logo=QLabel();logo.setPixmap(self._logoPx(28,28));logo.setFixedSize(28,28);l.addWidget(logo);l.addSpacing(7);self._title=QLabel("Scratch-X");self._title.setStyleSheet(f"color:{TEXT};font-size:15px;font-weight:700;");l.addWidget(self._title);l.addStretch();self._lang=QComboBox();self._lang.addItems(["Indonesia","English"]);self._lang.setFixedWidth(92);self._lang.setCurrentIndex(1 if self.lang=="en" else 0);self._lang.setToolTip(self.tr("Change language","Ganti bahasa"));l.addWidget(self._lang);l.addSpacing(6);self._ver=QLabel("v"+self.VERSION);self._ver.setStyleSheet(f"color:{MUTED};font-size:9px;");l.addWidget(self._ver);l.addSpacing(7);self._help=QPushButton("?");self._help.setFixedSize(30,30);self._help.setToolTip(self.tr("How to use Scratch-X","Cara menggunakan Scratch-X"));self._help.setStyleSheet(self._round_icon_style());self._help.clicked.connect(self._show_help);l.addWidget(self._help);self._about=QPushButton("i");self._about.setFixedSize(30,30);self._about.setToolTip(self.tr("About Scratch-X","Tentang Scratch-X"));self._about.setStyleSheet(self._round_icon_style());self._about.clicked.connect(self._show_about);l.addWidget(self._about);return bar
     def _round_icon_style(self):return f"QPushButton{{background:{CARD};border:1px solid {BORDER};border-radius:15px;color:{DIM};font-weight:700;font-size:12px;}}QPushButton:hover{{background:{HOV};color:white;border-color:{PRI};}}"
@@ -1266,7 +1271,7 @@ class ScratchXDialog(QDialog):
                     try:
                         ml=QgsSvgMarkerSymbolLayer(svg_path,self._sym_size,0.0);sym=QgsMarkerSymbol([ml]);
                         try:ml.setColor(fc);ml.setStrokeColor(bc);ml.setStrokeWidth(bw_mm)
-                        except Exception:pass
+                        except Exception as e:_sx_log_warning(f"Unable to apply SVG marker styling: {e}")
                     except Exception:sym=QgsMarkerSymbol.createSimple({})
                 else:
                     sym=QgsMarkerSymbol.createSimple({});ml=sym.symbolLayer(0);attr=SIMPLE_MARKERS.get(self._sym_sid,"Circle")
@@ -1283,11 +1288,11 @@ class ScratchXDialog(QDialog):
             self.iface.setActiveLayer(layer);layer.startEditing();canvas=self.iface.mapCanvas()
             if self._active_tool:
                 try:canvas.unsetMapTool(self._active_tool)
-                except Exception:pass
+                except Exception as e:_sx_log_warning(f"Unable to unset active map tool: {e}")
             if path:
                 def stopped():
                     try:layer.editingStopped.disconnect(stopped)
-                    except Exception:pass
+                    except Exception as e:_sx_log_warning(f"Unable to disconnect editingStopped handler: {e}")
                     self._auto_save(layer,path)
                 layer.editingStopped.connect(stopped)
             if self._geom=="Line":self._active_tool=ScratchXLineMapTool(canvas,self.iface,layer,self,self._line_mode);canvas.setMapTool(self._active_tool)
@@ -1307,8 +1312,8 @@ class ScratchXDialog(QDialog):
                 data=open(svg_path,"r",encoding="utf-8").read()
                 data=data.replace("param(fill)",self._fill_c.name()).replace("param(outline)",self._bdr_c.name()).replace("param(outline-width)",str(max(1.0,self._bw*1.5)))
                 return data
-            except Exception:
-                pass
+            except Exception as e:
+                _sx_log_warning(f"Unable to read SVG symbol '{svg_path}': {e}")
         # Basic marker fallback: create a clean SVG with the same geometry used by Scratch-X.
         fc=self._fill_c.name();bc=self._bdr_c.name();sw=max(1.0,self._bw*1.5)
         shapes={
@@ -1341,8 +1346,8 @@ class ScratchXDialog(QDialog):
                 image.fill(0)
                 painter=QPainter(image);renderer.render(painter);painter.end();image.save(out,"PNG")
                 return name
-            except Exception:
-                pass
+            except Exception as e:
+                _sx_log_warning(f"Unable to rasterize SVG symbol for KML: {e}")
         # Fallback keeps a usable local SVG reference if SVG rasterization is unavailable.
         svg_name=_safe_asset_name(self._sym_sid)+".svg"
         open(os.path.join(asset_dir,svg_name),"w",encoding="utf-8").write(svg)
@@ -1350,8 +1355,10 @@ class ScratchXDialog(QDialog):
 
     def _geom_coords(self,geom,ct):
         g=QgsGeometry(geom)
-        try:g.transform(ct)
-        except Exception:pass
+        try:
+            g.transform(ct)
+        except Exception as e:
+            _sx_log_warning(f"Unable to transform geometry for export: {e}")
         if QgsWkbTypes.isSingleType(g.wkbType()):
             pass
         return g
@@ -1433,15 +1440,15 @@ class ScratchXDialog(QDialog):
             try:
                 if layer.customProperty("ScratchX/temporary", False) is True or layer.customProperty("ScratchX/temporary", False) == "true":
                     ids.add(layer.id())
-            except Exception:
-                pass
+            except Exception as e:
+                _sx_log_warning(f"Unable to inspect layer temporary property: {e}")
         for lid in list(ids):
             if project.mapLayer(lid):
                 project.removeMapLayer(lid);removed+=1
         self._temp_layer_ids=[]
         if self._active_tool:
             try:self.iface.mapCanvas().unsetMapTool(self._active_tool)
-            except Exception:pass
+            except Exception as e:_sx_log_warning(f"Unable to unset active map tool during Clear: {e}")
             self._active_tool=None
         self.iface.statusBarIface().showMessage(self.tr(f"Scratch-X: {removed} temporary layer(s) cleared.",f"Scratch-X: {removed} layer temporary dibersihkan."))
     def _load_custom_symbols(self):

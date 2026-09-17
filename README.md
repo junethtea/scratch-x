@@ -35,8 +35,8 @@ Scratch-X is a free QGIS plugin for quickly creating **Line, LineString routes, 
 - **Edge-pan works while Scratch-X is minimized** — the active drawing session remains available while the floating window is minimized.
 - **Automatic file saving** — when a File Path is selected, each completed geometry is written to the selected datasource automatically. Manual **Save Layer Edits** is not required.
 - **Expanded attribute information** — saved features include geometry-related values such as longitude, latitude, distance, radius, or area where applicable.
-- **Automatic layer-name labeling** — generated layers can display their layer name directly on the map using compact black text with a yellow buffer.
-- **Improved Point labeling** — Point labels are positioned above the point symbol so the symbol remains visible.
+- **Automatic layer-name labeling** — generated layers can display their layer name directly on the map.
+
 
 ---
 

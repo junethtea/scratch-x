@@ -23,7 +23,7 @@ try:
 except Exception:
     QSvgRenderer = None
 
-from qgis.PyQt.QtCore import Qt, QPointF, QRectF, pyqtSignal, QSize, QUrl, QSettings, QEvent, QMetaType, QByteArray
+from qgis.PyQt.QtCore import Qt, QPointF, QRectF, pyqtSignal, QSize, QUrl, QSettings, QEvent, QMetaType, QByteArray, QSizeF, QTimer
 
 from qgis.core import (
     QgsVectorLayer, QgsProject, QgsField,
@@ -31,7 +31,7 @@ from qgis.core import (
     QgsMarkerSymbol, QgsSvgMarkerSymbolLayer, QgsLineSymbol, QgsFillSymbol,
     QgsSingleSymbolRenderer, QgsFeature, QgsGeometry,
     QgsPointXY, QgsWkbTypes, QgsEditFormConfig, QgsDistanceArea, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsMessageLog, Qgis
+    QgsMessageLog, Qgis, QgsPalLayerSettings, QgsTextFormat, QgsTextBufferSettings, QgsVectorLayerSimpleLabeling
 )
 from qgis.gui import QgsMapTool, QgsRubberBand
 
@@ -144,9 +144,11 @@ CIRCLE_SEGMENTS = 72
 try:
     _QTYPE_INT = QMetaType.Type.Int
     _QTYPE_STRING = QMetaType.Type.QString
+    _QTYPE_DOUBLE = QMetaType.Type.Double
 except AttributeError:
     _QTYPE_INT = QMetaType.Int
     _QTYPE_STRING = QMetaType.QString
+    _QTYPE_DOUBLE = QMetaType.Double
 
 # Central Qt5/Qt6 enum compatibility layer. UI/UX is intentionally unchanged
 # from the v3.1.7 baseline.
@@ -265,6 +267,21 @@ def _fmt_area(square_meters):
     if square_meters < 1000000:
         return f"{square_meters / 10000.0:.3f} ha"
     return f"{square_meters / 1000000.0:.3f} km²"
+
+def _fmt_meter_value(meters):
+    """Format a linear measurement explicitly in meters for the attribute table."""
+    try:
+        return f"{float(meters):.2f} m"
+    except Exception:
+        return "0.00 m"
+
+
+def _fmt_square_meter_value(square_meters):
+    """Format an area explicitly in square meters for the attribute table."""
+    try:
+        return f"{float(square_meters):.2f} m²"
+    except Exception:
+        return "0.00 m²"
 
 
 def _measurement_table(rows):
@@ -541,13 +558,6 @@ class LsBtn(QPushButton):
 
 
 class MeasurementOverlay(QFrame):
-    def __init__(self,parent=None):
-        super().__init__(parent, QT_TOOLTIP_WINDOW | QT_FRAMELESS_WINDOW); self.setAttribute(QT_WA_TRANSPARENT); self.setStyleSheet(f"QFrame{{background:{CARD};border:1px solid {PRI};border-radius:7px;}} QLabel{{color:{TEXT};background:transparent;font-size:10px;font-weight:600;padding:2px 7px;}}"); self.lab=QLabel(); l=QVBoxLayout(self); l.setContentsMargins(3,3,3,3); l.setSpacing(0); l.addWidget(self.lab); self.hide()
-    def show_measure(self,text,pos): self.lab.setText(text); self.adjustSize(); self.move(pos); self.show()
-    def clear(self): self.hide()
-
-
-class MeasurementOverlay(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent, QT_TOOLTIP_WINDOW | QT_FRAMELESS_WINDOW)
         self.setAttribute(QT_WA_TRANSPARENT)
@@ -565,6 +575,25 @@ class MeasurementOverlay(QFrame):
     def show_measure(self, text, pos):
         self.lab.setText(text)
         self.adjustSize()
+
+        # Keep the measurement overlay fully visible when the cursor is at
+        # any canvas edge/corner during auto-pan.
+        try:
+            screen = QApplication.screenAt(pos)
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                margin = 8
+                x = min(max(pos.x(), area.left() + margin),
+                        area.right() - self.width() - margin + 1)
+                y = min(max(pos.y(), area.top() + margin),
+                        area.bottom() - self.height() - margin + 1)
+                pos = type(pos)(x, y)
+        except Exception as e:
+            # Tooltip positioning must never interfere with drawing.
+            _sx_log_warning(f"Unable to clamp measurement tooltip: {e}")
+
         self.move(pos)
         self.show()
 
@@ -574,13 +603,14 @@ class MeasurementOverlay(QFrame):
 
 class ScratchXLineMapTool(QgsMapTool):
     """Route digitizer supporting two-point Line and multi-vertex LineString."""
-    def __init__(self, canvas, iface, layer, parent_dialog, mode="LineString"):
+    def __init__(self, canvas, iface, layer, parent_dialog, mode="LineString", output_path=""):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
         self.layer = layer
         self.dialog = parent_dialog
         self.mode = mode
+        self.output_path = output_path or ""
         self.points = []
         self.rb = None
         self.distance = QgsDistanceArea()
@@ -634,12 +664,17 @@ class ScratchXLineMapTool(QgsMapTool):
     def canvasMoveEvent(self, event):
         if not self.points:
             return
-        pt = self.toMapCoordinates(event.pos())
+        self._auto_pan_update(event.pos())
+
+    def _auto_pan_update(self, screen_pos):
+        if not self.points:
+            return
+        pt = self.toMapCoordinates(screen_pos)
         preview = list(self.points) + [pt]
         self._draw_rb(preview)
         segment = self._meters(self.points[-1], pt)
         route = self._route_distance(preview)
-        self._show(segment, route, event.pos())
+        self._show(segment, route, screen_pos)
 
     def keyPressEvent(self, event):
         esc = QT_ESC
@@ -696,9 +731,16 @@ class ScratchXLineMapTool(QgsMapTool):
         idx = self.layer.featureCount() + 1
         feat.setAttribute("id", idx)
         feat.setAttribute("name", self.layer.name())
+        mid=feat.geometry().centroid().asPoint()
+        lon,lat=self.dialog._to_wgs84(mid, self.layer.crs())
+        feat.setAttribute("longitude", lon)
+        feat.setAttribute("latitude", lat)
+        feat.setAttribute("distance", _fmt_meter_value(d))
         if self.layer.addFeature(feat):
             self.total += d
             self.dialog._line_total = self.total
+            if self.output_path:
+                self.dialog._auto_save(self.layer, self.output_path, notify=False)
             self.dialog._save_settings()
             self.points = []
             self._clear_rb()
@@ -727,13 +769,14 @@ class ScratchXLineMapTool(QgsMapTool):
 
 class ScratchXShapeMapTool(QgsMapTool):
     """Two-click shape engine for all Scratch-X shapes."""
-    def __init__(self, canvas, iface, layer, shape_type, dialog=None):
+    def __init__(self, canvas, iface, layer, shape_type, dialog=None, output_path=""):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
         self.layer = layer
         self.shape_type = shape_type
         self.dialog = dialog
+        self.output_path = output_path or ""
         self.anchor = None
         self.rb = None
         self.overlay = MeasurementOverlay(canvas.parent() or canvas.window())
@@ -760,11 +803,16 @@ class ScratchXShapeMapTool(QgsMapTool):
     def canvasMoveEvent(self, event):
         if self.anchor is None:
             return
-        pt = self.toMapCoordinates(event.pos())
+        self._auto_pan_update(event.pos())
+
+    def _auto_pan_update(self, screen_pos):
+        if self.anchor is None:
+            return
+        pt = self.toMapCoordinates(screen_pos)
         pts = self._points(self.anchor, pt)
         if pts:
             self._draw_rb(pts)
-            self._show_measure(pt, event.pos())
+            self._show_measure(pt, screen_pos)
 
     def keyPressEvent(self, event):
         esc = QT_ESC
@@ -867,27 +915,50 @@ class ScratchXShapeMapTool(QgsMapTool):
         self.iface.statusBarIface().showMessage("Scratch-X: drawing cancelled / gambar dibatalkan.")
 
     def _finish(self, pt):
-        pts=self._points(self.anchor,pt); self._clear_rb(); self.overlay.clear(); self.anchor=None
+        anchor = self.anchor
+        if anchor is None or pt is None:
+            self._cancel()
+            return
+        pts=self._points(anchor,pt); self._clear_rb(); self.overlay.clear(); self.anchor=None
         if pts and len(pts)>=4:
             feat=QgsFeature(self.layer.fields())
             feat.setGeometry(QgsGeometry.fromPolygonXY([pts]))
             idx=self.layer.featureCount()+1
             feat.setAttribute("id",idx); feat.setAttribute("name",self.layer.name())
-            self.layer.addFeature(feat); self.canvas.refresh()
+            center=feat.geometry().centroid().asPoint()
+            lon,lat=self.dialog._to_wgs84(center, self.layer.crs())
+            feat.setAttribute("longitude",lon); feat.setAttribute("latitude",lat)
+            if self.shape_type == "circle":
+                da=QgsDistanceArea(); da.setSourceCrs(self.layer.crs(),QgsProject.instance().transformContext()); da.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
+                try: radius=abs(da.measureLine(anchor,pt))
+                except Exception: radius=math.hypot(pt.x()-anchor.x(),pt.y()-anchor.y())
+                feat.setAttribute("radius",_fmt_meter_value(radius))
+            else:
+                da=QgsDistanceArea(); da.setSourceCrs(self.layer.crs(),QgsProject.instance().transformContext()); da.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
+                try: area=abs(da.measureArea(feat.geometry()))
+                except Exception: area=0.0
+                feat.setAttribute("area",_fmt_square_meter_value(area))
+            if self.layer.addFeature(feat):
+                if self.output_path:
+                    self.dialog._auto_save(self.layer, self.output_path, notify=False)
+            self.canvas.refresh()
 
     def deactivate(self):
         self._cancel(); super().deactivate()
 
 
 class ScratchXPointMapTool(QgsMapTool):
-    def __init__(self, canvas, iface, layer, dialog):
-        super().__init__(canvas); self.canvas=canvas; self.iface=iface; self.layer=layer; self.dialog=dialog
+    def __init__(self, canvas, iface, layer, dialog, output_path=""):
+        super().__init__(canvas); self.canvas=canvas; self.iface=iface; self.layer=layer; self.dialog=dialog; self.output_path=output_path or ""
         try: self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
         except AttributeError: self.setCursor(QCursor(QT_CROSS))
     def canvasPressEvent(self,event):
         left=QT_LEFT
         if event.button()!=left:return
-        pt=self.toMapCoordinates(event.pos()); feat=QgsFeature(self.layer.fields()); feat.setGeometry(QgsGeometry.fromPointXY(pt)); idx=self.layer.featureCount()+1; feat.setAttribute("id",idx); feat.setAttribute("name",self.layer.name()); self.layer.addFeature(feat); self.canvas.refresh()
+        pt=self.toMapCoordinates(event.pos()); feat=QgsFeature(self.layer.fields()); feat.setGeometry(QgsGeometry.fromPointXY(pt)); idx=self.layer.featureCount()+1; feat.setAttribute("id",idx); feat.setAttribute("name",self.layer.name()); lon,lat=self.dialog._to_wgs84(pt,self.layer.crs()); feat.setAttribute("longitude",lon); feat.setAttribute("latitude",lat)
+        if self.layer.addFeature(feat) and self.output_path:
+            self.dialog._auto_save(self.layer, self.output_path, notify=False)
+        self.canvas.refresh()
     def keyPressEvent(self,event):
         esc=QT_ESC
         if event.key()==esc:
@@ -897,8 +968,8 @@ class ScratchXPointMapTool(QgsMapTool):
 
 
 class ScratchXPolygonMapTool(QgsMapTool):
-    def __init__(self, canvas, iface, layer, dialog=None):
-        super().__init__(canvas); self.canvas=canvas; self.iface=iface; self.layer=layer; self.dialog=dialog; self.points=[]; self.rb=None
+    def __init__(self, canvas, iface, layer, dialog=None, output_path=""):
+        super().__init__(canvas); self.canvas=canvas; self.iface=iface; self.layer=layer; self.dialog=dialog; self.output_path=output_path or ""; self.points=[]; self.rb=None
         self.distance=QgsDistanceArea(); self.distance.setSourceCrs(layer.crs(), QgsProject.instance().transformContext()); self.distance.setEllipsoid(QgsProject.instance().ellipsoid() or "WGS84")
         self.overlay=MeasurementOverlay(canvas.parent() or canvas.window())
         try:self.setCursor(QCursor(QT_CROSS))
@@ -914,7 +985,10 @@ class ScratchXPolygonMapTool(QgsMapTool):
         self._finish()
     def canvasMoveEvent(self,event):
         if not self.points:return
-        pt=self.toMapCoordinates(event.pos()); pts=self.points+[pt]; self._draw(pts); self._show_measure(event.pos(),pts)
+        self._auto_pan_update(event.pos())
+    def _auto_pan_update(self,screen_pos):
+        if not self.points:return
+        pt=self.toMapCoordinates(screen_pos); pts=self.points+[pt]; self._draw(pts); self._show_measure(screen_pos,pts)
     def keyPressEvent(self,event):
         if event.key()==QT_ESC:self._cancel();event.accept();return
         super().keyPressEvent(event)
@@ -937,7 +1011,10 @@ class ScratchXPolygonMapTool(QgsMapTool):
         self.rb.addPoint(pts[-1],True)
     def _finish(self):
         if len(self.points)<3:self._cancel();return
-        pts=list(self.points);pts.append(pts[0]);feat=QgsFeature(self.layer.fields());feat.setGeometry(QgsGeometry.fromPolygonXY([pts]));idx=self.layer.featureCount()+1;feat.setAttribute("id",idx);feat.setAttribute("name",self.layer.name());self.layer.addFeature(feat);self.canvas.refresh();self._cancel()
+        pts=list(self.points);pts.append(pts[0]);feat=QgsFeature(self.layer.fields());feat.setGeometry(QgsGeometry.fromPolygonXY([pts]));idx=self.layer.featureCount()+1;feat.setAttribute("id",idx);feat.setAttribute("name",self.layer.name());center=feat.geometry().centroid().asPoint();lon,lat=self.dialog._to_wgs84(center,self.layer.crs());feat.setAttribute("longitude",lon);feat.setAttribute("latitude",lat);da=self.distance;area=abs(da.measureArea(feat.geometry()));feat.setAttribute("area",_fmt_square_meter_value(area))
+        if self.layer.addFeature(feat) and self.output_path:
+            self.dialog._auto_save(self.layer, self.output_path, notify=False)
+        self.canvas.refresh();self._cancel()
     def _cancel(self):
         self.points=[]
         if self.rb is not None:self.rb.reset();self.rb=None
@@ -973,14 +1050,14 @@ class SymbolPickerDialog(QDialog):
             f"QPushButton:hover{{background:{HOV};border-color:{PRI};}}"
             f"QToolTip{{background:{CARD};color:{TEXT};border:1px solid {BORDER};}}"
         )
-        l = QHBoxLayout(self)
+        layout = QHBoxLayout(self)
         self.cats = QListWidget()
         self.cats.setFixedWidth(165)
         self.cats.setSelectionMode(QABSTRACT_SINGLE)
         for c in SYMBOL_CATEGORIES:
             self.cats.addItem(c)
         self.cats.addItem(self.custom_category)
-        l.addWidget(self.cats)
+        layout.addWidget(self.cats)
 
         right = QVBoxLayout()
         self.search = QLineEdit()
@@ -1005,7 +1082,7 @@ class SymbolPickerDialog(QDialog):
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         right.addWidget(bb)
-        l.addLayout(right, 1)
+        layout.addLayout(right, 1)
 
         self.cats.currentRowChanged.connect(self._category)
         self.search.textChanged.connect(self._filter)
@@ -1083,26 +1160,26 @@ class AboutDialog(QDialog):
         super().__init__(parent); self.setWindowTitle("About Scratch-X"); self.resize(560,450); self.lang=lang; self.version=version; self._build()
     def _build(self):
         self.setStyleSheet(f"QDialog{{background:{BG};}} QLabel{{color:{TEXT};}} QPushButton{{background:{CARD};border:1px solid {BORDER};border-radius:6px;color:{TEXT};padding:7px 12px;}} QPushButton:hover{{background:{HOV};}}")
-        l=QVBoxLayout(self);title=QLabel("Scratch-X");title.setStyleSheet(f"color:{TEXT};font-size:20px;font-weight:700;");l.addWidget(title)
-        sub=QLabel("Fast and flexible scratch geometry tool for QGIS." if self.lang=="en" else "Tool gambar geometri scratch yang cepat dan fleksibel untuk QGIS.");sub.setWordWrap(True);l.addWidget(sub)
-        info=QLabel(f"<b>Version:</b> {self.version}<br><b>Author:</b> Jujun Junaedi<br><b>Contact:</b> <a href='mailto:jujun.junaedi@outlook.com'>jujun.junaedi@outlook.com</a>");info.setOpenExternalLinks(True);l.addWidget(info);l.addWidget(Divider())
+        layout=QVBoxLayout(self);title=QLabel("Scratch-X");title.setStyleSheet(f"color:{TEXT};font-size:20px;font-weight:700;");layout.addWidget(title)
+        sub=QLabel("Fast and flexible scratch geometry tool for QGIS." if self.lang=="en" else "Tool gambar geometri scratch yang cepat dan fleksibel untuk QGIS.");sub.setWordWrap(True) ;layout.addWidget(sub)
+        info=QLabel(f"<b>Version:</b> {self.version}<br><b>Author:</b> Jujun Junaedi<br><b>Contact:</b> <a href='mailto:jujun.junaedi@outlook.com'>jujun.junaedi@outlook.com</a>");info.setOpenExternalLinks(True);layout.addWidget(info);layout.addWidget(Divider())
         body=("Create Line, LineString, Point, Polygon and customizable Shapes directly on the QGIS map canvas. Includes dynamic measurements, categorized point symbols, custom symbols and saving to SHP, TAB, KML or GeoJSON." if self.lang=="en" else "Buat Line, LineString, Point, Polygon dan Shape yang dapat dikustomisasi langsung di kanvas peta QGIS. Mendukung pengukuran dinamis, kategori simbol Point, simbol custom dan penyimpanan ke SHP, TAB, KML atau GeoJSON.")
-        lb=QLabel(body);lb.setWordWrap(True);l.addWidget(lb)
-        support=QLabel("<b>Support Scratch-X Development</b><br>If Scratch-X is useful for your work, you can support its continued development." if self.lang=="en" else "<b>Dukung Pengembangan Scratch-X</b><br>Jika Scratch-X bermanfaat untuk pekerjaan Anda, Anda dapat mendukung pengembangan plugin ini.");support.setWordWrap(True);l.addWidget(support)
+        lb=QLabel(body);lb.setWordWrap(True);layout.addWidget(lb)
+        support=QLabel("<b>Support Scratch-X Development</b><br>If Scratch-X is useful for your work, you can support its continued development." if self.lang=="en" else "<b>Dukung Pengembangan Scratch-X</b><br>Jika Scratch-X bermanfaat untuk pekerjaan Anda, Anda dapat mendukung pengembangan plugin ini.");support.setWordWrap(True);layout.addWidget(support)
         row=QHBoxLayout()
         for txt,url in [("PayPal","https://paypal.me/junjunan81"),("Buy Me a Coffee","https://buymeacoffee.com/juneth"),("Saweria (IDN)","https://saweria.co/juneth")]:
             b=QPushButton(txt);b.clicked.connect(lambda _,u=url:QDesktopServices.openUrl(QUrl(u)));row.addWidget(b)
-        l.addLayout(row);l.addStretch();l.addWidget(QLabel("© 2025–2026 Jujun Junaedi"));close=QPushButton("OK");close.clicked.connect(self.accept);l.addWidget(close,0,Qt.AlignRight)
+        layout.addLayout(row);layout.addStretch();layout.addWidget(QLabel("© 2025–2026 Jujun Junaedi"));close=QPushButton("OK");close.clicked.connect(self.accept);layout.addWidget(close,0,Qt.AlignRight)
 
 
 class ScratchXDialog(QDialog):
-    VERSION="2.1.2"
+    VERSION="2.1.3"
     SETTINGS_ORG="ScratchX"
     SETTINGS_APP="ScratchX"
     def __init__(self,iface,parent=None):
         super().__init__(parent or iface.mainWindow());self.iface=iface;self.settings=QSettings(self.SETTINGS_ORG,self.SETTINGS_APP)
         self.lang=self.settings.value("language","id")
-        self._fill_c=QColor(self.settings.value("fill_color","#4ADE80"));self._bdr_c=QColor(self.settings.value("border_color","#FFFFFF"));self._trans=int(self.settings.value("transparency",40));self._bw=float(self.settings.value("line_width",2.0));self._sym_size=float(self.settings.value("symbol_size",12.0));self._ls=self.settings.value("line_style","solid");self._sym_sid=self.settings.value("symbol","circle");self._symbol_category=self.settings.value("symbol_category","Basic");self._geom="Line";self._line_mode=self.settings.value("line_mode","LineString");self._shape=self.settings.value("shape","circle");self._fmt=self.settings.value("format","shp");self._path="";self._active_tool=None;self._line_total=0.0;self._temp_layer_ids=[];self._custom_symbols=self._load_custom_symbols()
+        self._fill_c=QColor(self.settings.value("fill_color","#4ADE80"));self._bdr_c=QColor(self.settings.value("border_color","#FFFFFF"));self._trans=int(self.settings.value("transparency",40));self._bw=float(self.settings.value("line_width",2.0));self._sym_size=float(self.settings.value("symbol_size",12.0));self._ls=self.settings.value("line_style","solid");self._sym_sid=self.settings.value("symbol","circle");self._symbol_category=self.settings.value("symbol_category","Basic");self._geom="Line";self._line_mode=self.settings.value("line_mode","LineString");self._shape=self.settings.value("shape","circle");self._fmt=self.settings.value("format","shp");self._path="";self._active_tool=None;self._line_total=0.0;self._temp_layer_ids=[];self._custom_symbols=self._load_custom_symbols();self._edge_pan_timer=QTimer(self);self._edge_pan_timer.setInterval(40);self._edge_pan_timer.timeout.connect(self._edge_pan_tick)
         self.setWindowTitle("Scratch-X");self.setWindowFlags(QT_WINDOW|QT_WINDOW_TITLE|QT_WINDOW_SYSTEM_MENU|QT_WINDOW_MINIMIZE|QT_WINDOW_CLOSE);self.setModal(False);self.setMinimumSize(380,500)
         layout_rev="3.1.7"
         saved_rev=str(self.settings.value("layout_version",""))
@@ -1153,16 +1230,16 @@ class ScratchXDialog(QDialog):
         except Exception as e:
             _sx_log_warning(f"Unable to position Scratch-X window: {e}")
     def _mkTitle(self):
-        bar=QWidget();bar.setFixedHeight(46);bar.setStyleSheet(f"background:{PANEL};border-bottom:1px solid {BORDER};");l=QHBoxLayout(bar);l.setContentsMargins(12,0,10,0);logo=QLabel();logo.setPixmap(self._logoPx(28,28));logo.setFixedSize(28,28);l.addWidget(logo);l.addSpacing(7);self._title=QLabel("Scratch-X");self._title.setStyleSheet(f"color:{TEXT};font-size:15px;font-weight:700;");l.addWidget(self._title);l.addStretch();self._lang=QComboBox();self._lang.addItems(["Indonesia","English"]);self._lang.setFixedWidth(92);self._lang.setCurrentIndex(1 if self.lang=="en" else 0);self._lang.setToolTip(self.tr("Change language","Ganti bahasa"));l.addWidget(self._lang);l.addSpacing(6);self._ver=QLabel("v"+self.VERSION);self._ver.setStyleSheet(f"color:{MUTED};font-size:9px;");l.addWidget(self._ver);l.addSpacing(7);self._help=QPushButton("?");self._help.setFixedSize(30,30);self._help.setToolTip(self.tr("How to use Scratch-X","Cara menggunakan Scratch-X"));self._help.setStyleSheet(self._round_icon_style());self._help.clicked.connect(self._show_help);l.addWidget(self._help);self._about=QPushButton("i");self._about.setFixedSize(30,30);self._about.setToolTip(self.tr("About Scratch-X","Tentang Scratch-X"));self._about.setStyleSheet(self._round_icon_style());self._about.clicked.connect(self._show_about);l.addWidget(self._about);return bar
+        bar=QWidget();bar.setFixedHeight(46);bar.setStyleSheet(f"background:{PANEL};border-bottom:1px solid {BORDER};");bar_layout=QHBoxLayout(bar);bar_layout.setContentsMargins(12,0,10,0);logo=QLabel();logo.setPixmap(self._logoPx(28,28));logo.setFixedSize(28,28);bar_layout.addWidget(logo);bar_layout.addSpacing(7);self._title=QLabel("Scratch-X");self._title.setStyleSheet(f"color:{TEXT};font-size:15px;font-weight:700;");bar_layout.addWidget(self._title);bar_layout.addStretch();self._lang=QComboBox();self._lang.addItems(["Indonesia","English"]);self._lang.setFixedWidth(92);self._lang.setCurrentIndex(1 if self.lang=="en" else 0);self._lang.setToolTip(self.tr("Change language","Ganti bahasa"));bar_layout.addWidget(self._lang);bar_layout.addSpacing(6);self._ver=QLabel("v"+self.VERSION);self._ver.setStyleSheet(f"color:{MUTED};font-size:9px;");bar_layout.addWidget(self._ver);bar_layout.addSpacing(7);self._help=QPushButton("?");self._help.setFixedSize(30,30);self._help.setToolTip(self.tr("How to use Scratch-X","Cara menggunakan Scratch-X"));self._help.setStyleSheet(self._round_icon_style());self._help.clicked.connect(self._show_help);bar_layout.addWidget(self._help);self._about=QPushButton("i");self._about.setFixedSize(30,30);self._about.setToolTip(self.tr("About Scratch-X","Tentang Scratch-X"));self._about.setStyleSheet(self._round_icon_style());self._about.clicked.connect(self._show_about);bar_layout.addWidget(self._about);return bar
     def _round_icon_style(self):return f"QPushButton{{background:{CARD};border:1px solid {BORDER};border-radius:15px;color:{DIM};font-weight:700;font-size:12px;}}QPushButton:hover{{background:{HOV};color:white;border-color:{PRI};}}"
     def _logoPx(self,w,h):
         px=QPixmap(w,h);px.fill(QT_TRANSPARENT);p=QPainter(px);p.setRenderHint(QPAINTER_ANTIALIASING);p.setBrush(QBrush(QColor(PRI)));p.setPen(QT_NO_PEN);p.drawRoundedRect(0,0,w,h,6,6);p.setPen(QPen(QColor("white"),2,QT_SOLID,QT_ROUND_CAP));m=6;p.drawLine(m,m,w-m,h-m);p.drawLine(w-m,m,m,h-m);p.setBrush(QBrush(QColor(A_L)));p.setPen(QT_NO_PEN);p.drawEllipse(w//2-3,h//2-3,6,6);p.end();return px
     def _mkGeomCol(self):
-        w=QWidget();w.setMinimumWidth(0);l=QVBoxLayout(w);l.setContentsMargins(0,0,0,0);l.setSpacing(3);self._gh=QLabel();self._gh.setStyleSheet(f"color:{MUTED};font-size:8px;font-weight:700;");l.addWidget(self._gh);self._ggrp=QButtonGroup(self);self._gbtns={};self._geom_specs=[("Line","⌁",A_L),("Point","◆",A_P),("Polygon","⬟",A_PL),("Shape","◇",A_S)]
+        w=QWidget();w.setMinimumWidth(0);geom_layout=QVBoxLayout(w);geom_layout.setContentsMargins(0,0,0,0);geom_layout.setSpacing(3);self._gh=QLabel();self._gh.setStyleSheet(f"color:{MUTED};font-size:8px;font-weight:700;");geom_layout.addWidget(self._gh);self._ggrp=QButtonGroup(self);self._gbtns={};self._geom_specs=[("Line","⌁",A_L),("Point","◆",A_P),("Polygon","⬟",A_PL),("Shape","◇",A_S)]
         row=QHBoxLayout();row.setContentsMargins(0,0,0,0);row.setSpacing(5)
         for nm,ic,ac in self._geom_specs:
             b=GeomBtn(nm,ic,ac);b.setFixedHeight(34);b.setSizePolicy(QSP_EXPANDING,QSP_FIXED);self._ggrp.addButton(b);row.addWidget(b);self._gbtns[nm]=b;b.setToolTip(self.tr({"Line":"Line / LineString route","Point":"Place point symbols","Polygon":"Draw polygon","Shape":"Draw geometric shapes"}[nm],{"Line":"Gambar Line / LineString sebagai rute","Point":"Tempatkan simbol point","Polygon":"Gambar polygon","Shape":"Gambar bentuk geometri"}[nm]))
-        l.addLayout(row);self._gtip=QLabel();self._gtip.setWordWrap(True);self._gtip.setMinimumHeight(22);self._gtip.setMaximumHeight(25);self._gtip.setStyleSheet(f"background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.25);border-radius:6px;color:{MUTED};font-size:8px;padding:4px;");l.addWidget(self._gtip);return w
+        geom_layout.addLayout(row);self._gtip=QLabel();self._gtip.setWordWrap(True);self._gtip.setMinimumHeight(22);self._gtip.setMaximumHeight(25);self._gtip.setStyleSheet(f"background:rgba(99,102,241,.1);border:1px solid rgba(99,102,241,.25);border-radius:6px;color:{MUTED};font-size:8px;padding:4px;");geom_layout.addWidget(self._gtip);return w
 
     def _mkStyleCol(self):
         outer=QWidget();outer.setStyleSheet(f"background:{BG};");ol=QVBoxLayout(outer);ol.setContentsMargins(0,0,0,0);ol.setSpacing(1);self._sh=QLabel();self._sh.setStyleSheet(f"color:{MUTED};font-size:8px;font-weight:700;");ol.addWidget(self._sh);pan=QWidget();pan.setStyleSheet(f"background:{BG};border:1px solid {BORDER};border-radius:7px;");pl=QVBoxLayout(pan);pl.setContentsMargins(8,4,8,4);pl.setSpacing(2)
@@ -1179,9 +1256,9 @@ class ScratchXDialog(QDialog):
             b=ShapeBtn(sid,en if self.lang=="en" else idn);self._shapegrp.addButton(b);sg2.addWidget(b,i//5,i%5);self._shape_btns.append(b);b.clicked.connect(lambda _,s=sid:self._set_shape(s))
         self._shape_btns[0].setChecked(True);shl.addLayout(sg2);pl.addWidget(self._shape_sec);self._shape_sec.setVisible(False);self._sym_size_row.setVisible(False);ol.addWidget(pan,1);return outer
     def _mkSaveCol(self):
-        w=QWidget();w.setMinimumWidth(180);w.setMinimumHeight(96);l=QVBoxLayout(w);l.setContentsMargins(0,0,0,0);l.setSpacing(5);self._saveh=QLabel();self._saveh.setStyleSheet(f"color:{MUTED};font-size:8px;font-weight:700;letter-spacing:.8px;");l.addWidget(self._saveh);self._formatl=QLabel();self._formatl.setStyleSheet(f"color:{MUTED};font-size:9px;");l.addWidget(self._formatl);self._fcombo=QComboBox();self._fcombo.addItems(["ESRI Shapefile (*.shp)","MapInfo TAB (*.tab)","Keyhole Markup Language (*.kml)","GeoJSON (*.geojson)"]);self._fcombo.setCurrentIndex(["shp","tab","kml","geojson"].index(self._fmt) if self._fmt in ["shp","tab","kml","geojson"] else 0);l.addWidget(self._fcombo);self._pathl=QLabel();self._pathl.setStyleSheet(f"color:{MUTED};font-size:9px;");l.addWidget(self._pathl);row=QHBoxLayout();row.setSpacing(4);self._pedit=QLineEdit();self._pedit.setReadOnly(True);self._pedit.setText(self.tr("Temporary Layer","Temporary Layer"));self._pedit.setToolTip(self.tr("No path selected: the next layer is temporary.","Belum ada lokasi: layer berikutnya bersifat temporary."));row.addWidget(self._pedit,1);self._browsebtn=QPushButton();self._browsebtn.setIcon(QApplication.style().standardIcon(QSTYLE_DIR_OPEN));self._browsebtn.setIconSize(QSize(18,18));self._browsebtn.setFixedSize(32,28);self._browsebtn.setToolTip(self.tr("Choose output file/folder","Pilih file/folder penyimpanan"));self._browsebtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1px solid {BORDER};border-radius:6px;color:{TEXT};font-size:14px;}}QPushButton:hover{{background:{HOV};border-color:{PRI};}}QPushButton:pressed{{background:{PRI};}}");self._browsebtn.clicked.connect(self._browse);row.addWidget(self._browsebtn);l.addLayout(row);self._savehint=QLabel();self._savehint.setWordWrap(True);self._savehint.setStyleSheet(f"color:{MUTED};font-size:8px;padding-top:2px;");l.addWidget(self._savehint);return w
+        w=QWidget();w.setMinimumWidth(180);w.setMinimumHeight(96);save_layout=QVBoxLayout(w);save_layout.setContentsMargins(0,0,0,0);save_layout.setSpacing(5);self._saveh=QLabel();self._saveh.setStyleSheet(f"color:{MUTED};font-size:8px;font-weight:700;letter-spacing:.8px;");save_layout.addWidget(self._saveh);self._formatl=QLabel();self._formatl.setStyleSheet(f"color:{MUTED};font-size:9px;");save_layout.addWidget(self._formatl);self._fcombo=QComboBox();self._fcombo.addItems(["ESRI Shapefile (*.shp)","MapInfo TAB (*.tab)","Keyhole Markup Language (*.kml)","GeoJSON (*.geojson)"]);self._fcombo.setCurrentIndex(["shp","tab","kml","geojson"].index(self._fmt) if self._fmt in ["shp","tab","kml","geojson"] else 0);save_layout.addWidget(self._fcombo);self._pathl=QLabel();self._pathl.setStyleSheet(f"color:{MUTED};font-size:9px;");save_layout.addWidget(self._pathl);row=QHBoxLayout();row.setSpacing(4);self._pedit=QLineEdit();self._pedit.setReadOnly(True);self._pedit.setText(self.tr("Temporary Layer","Temporary Layer"));self._pedit.setToolTip(self.tr("No path selected: the next layer is temporary.","Belum ada lokasi: layer berikutnya bersifat temporary."));row.addWidget(self._pedit,1);self._browsebtn=QPushButton();self._browsebtn.setIcon(QApplication.style().standardIcon(QSTYLE_DIR_OPEN));self._browsebtn.setIconSize(QSize(18,18));self._browsebtn.setFixedSize(32,28);self._browsebtn.setToolTip(self.tr("Choose output file/folder","Pilih file/folder penyimpanan"));self._browsebtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1px solid {BORDER};border-radius:6px;color:{TEXT};font-size:14px;}}QPushButton:hover{{background:{HOV};border-color:{PRI};}}QPushButton:pressed{{background:{PRI};}}");self._browsebtn.clicked.connect(self._browse);row.addWidget(self._browsebtn);save_layout.addLayout(row);self._savehint=QLabel();self._savehint.setWordWrap(True);self._savehint.setStyleSheet(f"color:{MUTED};font-size:8px;padding-top:2px;");save_layout.addWidget(self._savehint);return w
     def _mkFooter(self):
-        f=QWidget();f.setFixedHeight(42);f.setStyleSheet(f"background:{PANEL};border-top:1px solid {BORDER};");l=QHBoxLayout(f);l.setContentsMargins(12,0,12,0);self._footerhint=QLabel();self._footerhint.setVisible(False);self._footerhint.setMaximumWidth(0);l.addWidget(self._footerhint);l.addStretch();self._clearbtn=QPushButton();self._clearbtn.setFixedSize(72,32);self._clearbtn.setToolTip(self.tr("Remove Scratch-X temporary layers from the current QGIS project.","Hapus layer temporary Scratch-X dari project QGIS saat ini."));self._clearbtn.clicked.connect(self._clear_temp_layers);self._clearbtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1.5px solid {BORDER};border-radius:7px;color:{DIM};font-size:11px;}}QPushButton:hover{{background:{HOV};color:white;border-color:#EF4444;}}");l.addWidget(self._clearbtn);self._closebtn=QPushButton();self._closebtn.setFixedSize(64,32);self._closebtn.clicked.connect(self.hide);self._closebtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1.5px solid {BORDER};border-radius:7px;color:{DIM};font-size:11px;}}QPushButton:hover{{background:{HOV};color:white;}}");l.addWidget(self._closebtn);self._mkbtn=QPushButton();self._mkbtn.setFixedSize(118,32);self._mkbtn.setStyleSheet(f"QPushButton{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {PRI},stop:1 #8B5CF6);border:none;border-radius:7px;color:white;font-size:11px;font-weight:600;}}QPushButton:hover{{background:#7C3AED;}}");self._mkbtn.clicked.connect(self._create);l.addWidget(self._mkbtn);return f
+        f=QWidget();f.setFixedHeight(42);f.setStyleSheet(f"background:{PANEL};border-top:1px solid {BORDER};");footer_layout=QHBoxLayout(f);footer_layout.setContentsMargins(12,0,12,0);self._footerhint=QLabel();self._footerhint.setVisible(False);self._footerhint.setMaximumWidth(0);footer_layout.addWidget(self._footerhint);footer_layout.addStretch();self._clearbtn=QPushButton();self._clearbtn.setFixedSize(72,32);self._clearbtn.setToolTip(self.tr("Remove Scratch-X temporary layers from the current QGIS project.","Hapus layer temporary Scratch-X dari project QGIS saat ini."));self._clearbtn.clicked.connect(self._clear_temp_layers);self._clearbtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1.5px solid {BORDER};border-radius:7px;color:{DIM};font-size:11px;}}QPushButton:hover{{background:{HOV};color:white;border-color:#EF4444;}}");footer_layout.addWidget(self._clearbtn);self._closebtn=QPushButton();self._closebtn.setFixedSize(64,32);self._closebtn.clicked.connect(self.hide);self._closebtn.setStyleSheet(f"QPushButton{{background:{CARD};border:1.5px solid {BORDER};border-radius:7px;color:{DIM};font-size:11px;}}QPushButton:hover{{background:{HOV};color:white;}}");footer_layout.addWidget(self._closebtn);self._mkbtn=QPushButton();self._mkbtn.setFixedSize(118,32);self._mkbtn.setStyleSheet(f"QPushButton{{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {PRI},stop:1 #8B5CF6);border:none;border-radius:7px;color:white;font-size:11px;font-weight:600;}}QPushButton:hover{{background:#7C3AED;}}");self._mkbtn.clicked.connect(self._create);footer_layout.addWidget(self._mkbtn);return f
     def _wire(self):
         for nm,b in self._gbtns.items():b.clicked.connect(lambda _,n=nm:self._sel_geom(n))
         self._fill_blk.changed.connect(lambda c:self._set_and_save("fill_color",c.name(),"_fill_c"));self._bdr_blk.changed.connect(lambda c:self._set_and_save("border_color",c.name(),"_bdr_c"));self._tsl.valueChanged.connect(self._on_trans);self._bwspin.valueChanged.connect(lambda v:self._set_and_save("line_width",v,"_bw"));self._sym_sizespin.valueChanged.connect(lambda v:self._set_and_save("symbol_size",v,"_sym_size"));self._fcombo.currentIndexChanged.connect(self._on_format);self._lang.currentIndexChanged.connect(self._change_lang);self._line_mode_combo.currentIndexChanged.connect(self._on_line_mode)
@@ -1194,7 +1271,7 @@ class ScratchXDialog(QDialog):
     def _on_line_mode(self,i):self._line_mode="LineString" if i==1 else "Line";self.settings.setValue("line_mode",self._line_mode)
     def _change_lang(self,i):self.lang="en" if i==1 else "id";self.settings.setValue("language",self.lang);self._retranslate()
     def _retranslate(self):
-        self._gh.setText(self.tr("1. GEOMETRY TYPE","1. JENIS GEOMETRI"));self._sh.setText(self.tr("2. STYLE","2. STYLE"));self._saveh.setText(self.tr("3. SAVE GEOMETRY","3. SIMPAN GEOMETRI"));self._formatl.setText(self.tr("Format","Format"));self._pathl.setText(self.tr("File Path","File Path"));self._savehint.setText(self.tr("After Create Layer, the next geometry starts with Temporary Layer. Choose a path only when you want to save the next geometry.","Setelah Buat Layer, geometri berikutnya kembali ke Temporary Layer. Pilih lokasi hanya jika geometri berikutnya ingin disimpan."));self._footerhint.setText(self.tr("Select geometry → configure style → create layer → draw on canvas.","Pilih geometri → atur style → buat layer → gambar di kanvas."));self._clearbtn.setText(self.tr("Clear","Bersihkan"));self._closebtn.setText(self.tr("Close","Tutup"));self._mkbtn.setText(self.tr("  +  Create Layer","  +  Buat Layer"));self._translab.setText(self.tr("Transparency","Transparansi"));self._bwl.setText(self.tr("Line Width","Lebar Garis"));self._symsizel.setText(self.tr("Symbol Size","Ukuran Simbol"));self._lsl.setText(self.tr("Line Style","Gaya Garis"));self._syml.setText(self.tr("Point Symbol","Simbol Point"));self._more_sym.setText(self.tr("More Symbols…","Simbol Lainnya…"));self._shapel.setText(self.tr("Shape","Bentuk"));self._linemode.setText(self.tr("Draw mode","Mode gambar"));self._line_mode_combo.setItemText(0,self.tr("Line (2-point)","Line (2-titik)"));self._line_mode_combo.setItemText(1,self.tr("LineString (Route)","LineString (Rute)"));self._pedit.setText(self._path if self._path else "Temporary Layer");self._help.setToolTip(self.tr("How to use Scratch-X","Cara menggunakan Scratch-X"));self._about.setToolTip(self.tr("About Scratch-X","Tentang Scratch-X"));self._browsebtn.setToolTip(self.tr("Choose output file/folder","Pilih file/folder penyimpanan"));self._update_shape_tips()
+        self._gh.setText(self.tr("1. GEOMETRY TYPE","1. JENIS GEOMETRI"));self._sh.setText(self.tr("2. STYLE","2. STYLE"));self._saveh.setText(self.tr("3. SAVE GEOMETRY","3. SIMPAN GEOMETRI"));self._formatl.setText(self.tr("Format","Format"));self._pathl.setText(self.tr("File Path","File Path"));self._savehint.setText(self.tr("After Create Layer, the next geometry starts with Temporary Layer. Finished geometries are saved automatically when a file path is selected.","Setelah Buat Layer, geometri berikutnya kembali ke Temporary Layer. Geometri yang selesai otomatis disimpan jika lokasi file dipilih."));self._footerhint.setText(self.tr("Select geometry → configure style → create layer → draw on canvas.","Pilih geometri → atur style → buat layer → gambar di kanvas."));self._clearbtn.setText(self.tr("Clear","Bersihkan"));self._closebtn.setText(self.tr("Close","Tutup"));self._mkbtn.setText(self.tr("  +  Create Layer","  +  Buat Layer"));self._translab.setText(self.tr("Transparency","Transparansi"));self._bwl.setText(self.tr("Line Width","Lebar Garis"));self._symsizel.setText(self.tr("Symbol Size","Ukuran Simbol"));self._lsl.setText(self.tr("Line Style","Gaya Garis"));self._syml.setText(self.tr("Point Symbol","Simbol Point"));self._more_sym.setText(self.tr("More Symbols…","Simbol Lainnya…"));self._shapel.setText(self.tr("Shape","Bentuk"));self._linemode.setText(self.tr("Draw mode","Mode gambar"));self._line_mode_combo.setItemText(0,self.tr("Line (2-point)","Line (2-titik)"));self._line_mode_combo.setItemText(1,self.tr("LineString (Route)","LineString (Rute)"));self._pedit.setText(self._path if self._path else "Temporary Layer");self._help.setToolTip(self.tr("How to use Scratch-X","Cara menggunakan Scratch-X"));self._about.setToolTip(self.tr("About Scratch-X","Tentang Scratch-X"));self._browsebtn.setToolTip(self.tr("Choose output file/folder","Pilih file/folder penyimpanan"));self._update_shape_tips()
     def _on_trans(self,v):self._trans=v;self._tvl.setText(f"{v} %");self.settings.setValue("transparency",v)
     def _sel_geom(self,nm):
         self._geom=nm
@@ -1245,22 +1322,159 @@ class ScratchXDialog(QDialog):
             if not path.lower().endswith(ext):path+=ext
             self._path=path;self._pedit.setText(path)
     def _unique_temp_name(self,base):
-        names={l.name() for l in QgsProject.instance().mapLayers().values()};n=base;i=2
+        names={layer.name() for layer in QgsProject.instance().mapLayers().values()};n=base;i=2
         while n in names:n=f"{base}_{i}";i+=1
         return n
+    def _edge_pan_tick(self):
+        """Pan the map automatically while an active drawing cursor reaches a canvas edge."""
+        canvas=self.iface.mapCanvas()
+        tool=self._active_tool
+        if tool is None or canvas.mapTool() is not tool:
+            return
+        # Only multi-step drawing tools need edge panning. Point placement is instantaneous.
+        drawing = bool(getattr(tool, "points", None)) or getattr(tool, "anchor", None) is not None
+        if not drawing:
+            return
+        pos=canvas.mapFromGlobal(QCursor.pos())
+        w,h=canvas.width(),canvas.height()
+        if w <= 0 or h <= 0 or pos.x() < 0 or pos.y() < 0 or pos.x() >= w or pos.y() >= h:
+            return
+        edge=45
+        vx=0.0; vy=0.0
+        if pos.x() < edge:
+            vx=-(edge-pos.x())/float(edge)
+        elif pos.x() > w-edge:
+            vx=(pos.x()-(w-edge))/float(edge)
+        # Screen Y grows downward. To keep drawing under the cursor:
+        # - cursor at TOP edge -> move map content DOWN
+        # - cursor at BOTTOM edge -> move map content UP
+        # Map-coordinate Y has the opposite screen direction, so invert it.
+        if pos.y() < edge:
+            vy=-(edge-pos.y())/float(edge)
+        elif pos.y() > h-edge:
+            vy=(pos.y()-(h-edge))/float(edge)
+        if vx == 0.0 and vy == 0.0:
+            return
+        speed=2.0+8.0*max(abs(vx),abs(vy))
+        vx*=speed; vy*=speed
+        # Convert a screen-pixel direction into map coordinates, respecting map rotation.
+        ct=canvas.getCoordinateTransform()
+        cpos=QPointF(w/2.0,h/2.0).toPoint()
+        c0=ct.toMapCoordinates(cpos)
+        c1=ct.toMapCoordinates(QPointF(w/2.0+vx,h/2.0+vy).toPoint())
+        dx=c1.x()-c0.x(); dy=c1.y()-c0.y()
+        if abs(dx) < 1e-15 and abs(dy) < 1e-15:
+            return
+        center=canvas.center()
+        canvas.setCenter(QgsPointXY(center.x()+dx,center.y()+dy))
+        update=getattr(tool,"_auto_pan_update",None)
+        if update:
+            update(pos)
+
+    def _start_edge_pan(self):
+        if not self._edge_pan_timer.isActive():
+            self._edge_pan_timer.start()
+
     def _create(self):
         gmap={"Line":"LineString","Point":"Point","Polygon":"Polygon","Shape":"Polygon"};gs=gmap[self._geom]
         current_path=self._path
         nm=os.path.splitext(os.path.basename(current_path))[0] if current_path else self._unique_temp_name("scratch_"+self._geom.lower())
         proj_crs=QgsProject.instance().crs().authid() or "EPSG:4326";vl=QgsVectorLayer(f"{gs}?crs={proj_crs}",nm,"memory")
         if not vl.isValid():QMessageBox.critical(self,self.tr("Error","Error"),self.tr("Failed to create layer.","Gagal membuat layer."));return
-        vl.dataProvider().addAttributes([QgsField("id", _QTYPE_INT), QgsField("name", _QTYPE_STRING), QgsField("notes", _QTYPE_STRING)]);vl.updateFields();self._apply_sym(vl,gs);QgsProject.instance().addMapLayer(vl)
+        fields=[
+            QgsField("id", _QTYPE_INT),
+            QgsField("name", _QTYPE_STRING),
+            QgsField("longitude", _QTYPE_DOUBLE),
+            QgsField("latitude", _QTYPE_DOUBLE),
+        ]
+        if self._geom == "Line":
+            fields.append(QgsField("distance", _QTYPE_STRING))
+        elif self._geom == "Shape" and self._shape == "circle":
+            fields.append(QgsField("radius", _QTYPE_STRING))
+        elif self._geom in ("Polygon", "Shape"):
+            fields.append(QgsField("area", _QTYPE_STRING))
+        fields.append(QgsField("notes", _QTYPE_STRING))
+        vl.dataProvider().addAttributes(fields);vl.updateFields();self._apply_sym(vl,gs);self._apply_layer_label(vl);QgsProject.instance().addMapLayer(vl)
         vl.setCustomProperty("ScratchX/temporary", not bool(current_path))
         vl.setCustomProperty("ScratchX/version", self.VERSION)
         if not current_path:self._temp_layer_ids.append(vl.id())
         self._line_total=0.0;self._activate(vl,gs,current_path)
         # Critical: the next Create Layer operation ALWAYS starts from Temporary Layer.
         self._path="";self._pedit.setText("Temporary Layer");self._save_settings()
+    def _to_wgs84(self,point,source_crs):
+        """Return longitude/latitude in WGS84 for an arbitrary layer CRS."""
+        try:
+            src=QgsCoordinateReferenceSystem(source_crs) if not isinstance(source_crs,QgsCoordinateReferenceSystem) else source_crs
+            dst=QgsCoordinateReferenceSystem("EPSG:4326")
+            if src.authid()==dst.authid():
+                return float(point.x()),float(point.y())
+            tr=QgsCoordinateTransform(src,dst,QgsProject.instance().transformContext())
+            p=tr.transform(point)
+            return float(p.x()),float(p.y())
+        except Exception as e:
+            _sx_log_warning(f"Unable to transform coordinates to WGS84: {e}")
+            return float(point.x()),float(point.y())
+
+    def _apply_layer_label(self,layer):
+        """Automatically label every Scratch-X feature with its layer name.
+
+        Labels use white text on a black fill with a yellow buffer/outline.
+        Line labels are centered on the line; point and polygon labels are
+        placed directly over the point/centroid.
+        """
+        try:
+            pal=QgsPalLayerSettings()
+            pal.fieldName="name"
+            if layer.geometryType() == QgsWkbTypes.LineGeometry:
+                pal.placement=Qgis.LabelPlacement.Line
+                try:
+                    pal.lineSettings().setLineAnchorPercent(0.5)
+                except Exception as e:
+                    _sx_log_warning(f"Unable to center line label: {e}")
+            elif layer.geometryType() == QgsWkbTypes.PointGeometry:
+                # Keep point symbols visible: place the label above the point,
+                # never centered on top of the symbol.
+                pal.placement=Qgis.LabelPlacement.OverPoint
+                pal.quadOffset=Qgis.LabelQuadrantPosition.Above
+                pal.offsetType=Qgis.LabelOffsetType.FromPoint
+                pal.distUnits=Qgis.RenderUnit.Millimeters
+                pal.dist=1.5
+            else:
+                # Polygon/Shape labels stay centered on their centroid.
+                pal.placement=Qgis.LabelPlacement.OverPoint
+                pal.centroidWhole=True
+                try:
+                    pal.centroidInside=True
+                except Exception as e:
+                    _sx_log_warning(f"Unable to set centroid-inside placement: {e}")
+
+            # Compact map label: black text with a yellow buffer/halo.
+            # No filled rectangle/background, so labels stay lightweight and
+            # do not visually overpower the map or geometry symbols.
+            fmt=QgsTextFormat()
+            fmt.setColor(QColor("#000000"))
+            fmt.setSize(9.0)
+            try:
+                buf=QgsTextBufferSettings()
+                buf.setEnabled(True)
+                buf.setSize(1.0)
+                buf.setSizeUnit(Qgis.RenderUnit.Millimeters)
+                buf.setColor(QColor("#FFD400"))
+                buf.setOpacity(1.0)
+                try:
+                    buf.setFillBufferInterior(False)
+                except Exception as e:
+                    _sx_log_warning(f"Unable to disable buffer interior fill: {e}")
+                fmt.setBuffer(buf)
+            except Exception as e:
+                _sx_log_warning(f"Unable to style label buffer: {e}")
+            pal.setFormat(fmt)
+            layer.setLabelsEnabled(True)
+            layer.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+            layer.triggerRepaint()
+        except Exception as e:
+            _sx_log_warning(f"Unable to apply layer-name label: {e}")
+
     def _apply_sym(self,layer,gs):
         alpha=int((1-self._trans/100.0)*255);fc=QColor(self._fill_c);fc.setAlpha(alpha);bc=QColor(self._bdr_c);bw_mm=self._bw*.25;qgis_ls={"solid":"solid","dash":"dash","dot":"dot","dashdot":"dash dot","dashdotdot":"dash dot dot","longdash":"dash"}.get(self._ls,"solid")
         def ca(c):return f"{c.red()},{c.green()},{c.blue()},{c.alpha()}"
@@ -1289,17 +1503,12 @@ class ScratchXDialog(QDialog):
             if self._active_tool:
                 try:canvas.unsetMapTool(self._active_tool)
                 except Exception as e:_sx_log_warning(f"Unable to unset active map tool: {e}")
-            if path:
-                def stopped():
-                    try:layer.editingStopped.disconnect(stopped)
-                    except Exception as e:_sx_log_warning(f"Unable to disconnect editingStopped handler: {e}")
-                    self._auto_save(layer,path)
-                layer.editingStopped.connect(stopped)
-            if self._geom=="Line":self._active_tool=ScratchXLineMapTool(canvas,self.iface,layer,self,self._line_mode);canvas.setMapTool(self._active_tool)
-            elif self._geom=="Shape":self._active_tool=ScratchXShapeMapTool(canvas,self.iface,layer,self._shape,self);canvas.setMapTool(self._active_tool)
-            elif self._geom=="Point":self._active_tool=ScratchXPointMapTool(canvas,self.iface,layer,self);canvas.setMapTool(self._active_tool)
-            else:self._active_tool=ScratchXPolygonMapTool(canvas,self.iface,layer,self);canvas.setMapTool(self._active_tool)
-            if path:msg=self.tr("Layer ready. Finish drawing, then click Stop Editing to write the geometry to the selected file.","Layer siap. Selesaikan gambar, lalu klik Stop Editing untuk menulis geometri ke file yang dipilih.")
+            if self._geom=="Line":self._active_tool=ScratchXLineMapTool(canvas,self.iface,layer,self,self._line_mode,path);canvas.setMapTool(self._active_tool)
+            elif self._geom=="Shape":self._active_tool=ScratchXShapeMapTool(canvas,self.iface,layer,self._shape,self,path);canvas.setMapTool(self._active_tool)
+            elif self._geom=="Point":self._active_tool=ScratchXPointMapTool(canvas,self.iface,layer,self,path);canvas.setMapTool(self._active_tool)
+            else:self._active_tool=ScratchXPolygonMapTool(canvas,self.iface,layer,self,path);canvas.setMapTool(self._active_tool)
+            self._start_edge_pan()
+            if path:msg=self.tr("Layer ready. Each finished geometry is saved automatically to the selected file.","Layer siap. Setiap geometri yang selesai akan otomatis disimpan ke file yang dipilih.")
             else:msg=self.tr("Temporary Layer ready. The next Create Layer operation will start again as Temporary Layer.","Temporary Layer siap. Pembuatan layer berikutnya akan kembali ke Temporary Layer.")
             self.iface.statusBarIface().showMessage(msg)
         except Exception as e:QMessageBox.critical(self,self.tr("Activation Error","Error Aktivasi"),str(e))
@@ -1360,7 +1569,7 @@ class ScratchXDialog(QDialog):
         except Exception as e:
             _sx_log_warning(f"Unable to transform geometry for export: {e}")
         if QgsWkbTypes.isSingleType(g.wkbType()):
-            pass
+            g=QgsGeometry(g)
         return g
 
     def _write_kml(self,layer,path):
@@ -1419,16 +1628,21 @@ class ScratchXDialog(QDialog):
         xml.extend(['</Document>','</kml>'])
         with open(path,"w",encoding="utf-8") as f:f.write("\n".join(xml))
 
-    def _auto_save(self,layer,path):
+    def _auto_save(self,layer,path,notify=True):
         try:
             if os.path.splitext(path)[1].lower()==".kml":
                 self._write_kml(layer,path)
                 extra=self.tr("Point symbols are stored in the adjacent _assets folder so Google Earth can render the same symbol.","Simbol Point disimpan di folder _assets di sebelah file KML agar Google Earth menampilkan simbol yang sama.") if layer.geometryType()==QgsWkbTypes.PointGeometry else ""
-                QMessageBox.information(self,self.tr("Geometry Saved","Geometri Tersimpan"),self.tr(f"Geometry saved to:\n{path}\n\n{extra}",f"Geometri berhasil disimpan ke:\n{path}\n\n{extra}"))
+                if notify:
+                    QMessageBox.information(self,self.tr("Geometry Saved","Geometri Tersimpan"),self.tr(f"Geometry saved to:\n{path}\n\n{extra}",f"Geometri berhasil disimpan ke:\n{path}\n\n{extra}"))
+                self.iface.statusBarIface().showMessage(self.tr(f"Scratch-X: saved to {path}",f"Scratch-X: tersimpan ke {path}"))
                 return
             drv={"shp":"ESRI Shapefile","tab":"MapInfo File","geojson":"GeoJSON"}.get(os.path.splitext(path)[1].lstrip('.').lower(),"ESRI Shapefile")
             opts=QgsVectorFileWriter.SaveVectorOptions();opts.driverName=drv;opts.fileEncoding="UTF-8";err=QgsVectorFileWriter.writeAsVectorFormatV3(layer,path,QgsProject.instance().transformContext(),opts);code=err[0] if isinstance(err,(tuple,list)) else err;msg=err[1] if isinstance(err,(tuple,list)) and len(err)>1 else ""
-            if code==QgsVectorFileWriter.NoError:QMessageBox.information(self,self.tr("Geometry Saved","Geometri Tersimpan"),self.tr(f"Geometry saved to:\n{path}",f"Geometri berhasil disimpan ke:\n{path}"))
+            if code==QgsVectorFileWriter.NoError:
+                if notify:
+                    QMessageBox.information(self,self.tr("Geometry Saved","Geometri Tersimpan"),self.tr(f"Geometry saved to:\n{path}",f"Geometri berhasil disimpan ke:\n{path}"))
+                self.iface.statusBarIface().showMessage(self.tr(f"Scratch-X: saved to {path}",f"Scratch-X: tersimpan ke {path}"))
             else:QMessageBox.critical(self,self.tr("Save Failed","Gagal Simpan"),f"{msg}\n\n{path}")
         except Exception as e:QMessageBox.critical(self,self.tr("Save Error","Error Simpan"),str(e))
     def _clear_temp_layers(self):
@@ -1446,6 +1660,8 @@ class ScratchXDialog(QDialog):
             if project.mapLayer(lid):
                 project.removeMapLayer(lid);removed+=1
         self._temp_layer_ids=[]
+        if self._edge_pan_timer.isActive():
+            self._edge_pan_timer.stop()
         if self._active_tool:
             try:self.iface.mapCanvas().unsetMapTool(self._active_tool)
             except Exception as e:_sx_log_warning(f"Unable to unset active map tool during Clear: {e}")
@@ -1458,9 +1674,25 @@ class ScratchXDialog(QDialog):
     def _save_custom_symbols(self):self.settings.setValue("custom_symbols",self._custom_symbols)
     def _save_settings(self):
         self.settings.setValue("language",self.lang);self.settings.setValue("fill_color",self._fill_c.name());self.settings.setValue("border_color",self._bdr_c.name());self.settings.setValue("transparency",self._trans);self.settings.setValue("line_width",self._bw);self.settings.setValue("symbol_size",self._sym_size);self.settings.setValue("line_style",self._ls);self.settings.setValue("symbol",self._sym_sid);self.settings.setValue("shape",self._shape);self.settings.setValue("format",self._fmt);self.settings.setValue("line_mode",self._line_mode);self.settings.setValue("width",max(390,min(620,self.width())));self.settings.setValue("height",max(540,min(820,self.height())));self.settings.setValue("layout_version","3.1.7");self._save_custom_symbols()
-    def closeEvent(self,event):self._save_settings();event.accept()
-    def hideEvent(self,event):self._save_settings();super().hideEvent(event)
+    def closeEvent(self,event):
+        if self._edge_pan_timer.isActive():self._edge_pan_timer.stop()
+        self._save_settings();event.accept()
+    def hideEvent(self,event):
+        # Hiding/minimizing the floating panel must NOT interrupt an active drawing session.
+        # The auto-pan timer is intentionally kept alive while the dialog is hidden.
+        self._save_settings();super().hideEvent(event)
+
+    def changeEvent(self,event):
+        try:
+            if event.type() == QEvent.Type.WindowStateChange:
+                # When the panel is minimized, keep edge auto-pan running so the map
+                # can still follow the drawing cursor.
+                if self.isMinimized() and self._active_tool is not None:
+                    self._start_edge_pan()
+        except Exception as e:
+            _sx_log_warning(f"Unable to handle Scratch-X window state change: {e}")
+        super().changeEvent(event)
     def _show_help(self):
-        title=self.tr("How To","Cara Menggunakan");text=("<h3>How to use Scratch-X</h3><ol><li>Select Geometry.</li><li>Configure Style.</li><li>Choose a format and optionally select a file path.</li><li>Click Create Layer.</li><li>Draw directly on the QGIS canvas.</li><li>Press ESC to cancel the current drawing.</li></ol><b>Line / LineString:</b> Line creates a 2-point feature. LineString creates a multi-vertex route; double-click finishes. Live segment, route and cumulative distance are shown.<br><b>Circle:</b> draw from the center; the radius is shown dynamically.<br><b>Point:</b> choose a symbol, More Symbols, or load custom SVG symbols.<br><b>Polygon:</b> click vertices and double-click to finish.<br><b>Save:</b> after Create Layer, the next geometry always resets to Temporary Layer." if self.lang=="en" else "<h3>Cara menggunakan Scratch-X</h3><ol><li>Pilih Geometri.</li><li>Atur Style.</li><li>Pilih format dan, bila perlu, pilih lokasi file.</li><li>Klik Buat Layer.</li><li>Gambar langsung di kanvas QGIS.</li><li>Tekan ESC untuk membatalkan gambar yang sedang berjalan.</li></ol><b>Line / LineString:</b> Line membuat feature 2 titik. LineString membuat rute dengan banyak titik; double-click untuk selesai. Segment, route dan total kumulatif tampil dinamis.<br><b>Circle:</b> gambar dari titik tengah; radius tampil dinamis.<br><b>Point:</b> pilih simbol, Simbol Lainnya, atau muat SVG custom.<br><b>Polygon:</b> klik titik-titik lalu double-click untuk selesai.<br><b>Simpan:</b> setelah Buat Layer, geometri berikutnya selalu kembali ke Temporary Layer.")
+        title=self.tr("How To","Cara Menggunakan");text=("<h3>How to use Scratch-X</h3><ol><li>Select Geometry.</li><li>Configure Style.</li><li>Choose a format and optionally select a file path.</li><li>Click Create Layer.</li><li>Draw directly on the QGIS canvas.</li><li>Press ESC to cancel the current drawing.</li></ol><b>Line / LineString:</b> Line creates a 2-point feature. LineString creates a multi-vertex route; double-click finishes. Live segment, route and cumulative distance are shown.<br><b>Circle:</b> draw from the center; the radius is shown dynamically.<br><b>Point:</b> choose a symbol, More Symbols, or load custom SVG symbols.<br><b>Polygon:</b> click vertices and double-click to finish.<br><b>Save:</b> finished geometries are saved automatically when a file path is selected. After Create Layer, the next geometry always resets to Temporary Layer." if self.lang=="en" else "<h3>Cara menggunakan Scratch-X</h3><ol><li>Pilih Geometri.</li><li>Atur Style.</li><li>Pilih format dan, bila perlu, pilih lokasi file.</li><li>Klik Buat Layer.</li><li>Gambar langsung di kanvas QGIS.</li><li>Tekan ESC untuk membatalkan gambar yang sedang berjalan.</li></ol><b>Line / LineString:</b> Line membuat feature 2 titik. LineString membuat rute dengan banyak titik; double-click untuk selesai. Segment, route dan total kumulatif tampil dinamis.<br><b>Circle:</b> gambar dari titik tengah; radius tampil dinamis.<br><b>Point:</b> pilih simbol, Simbol Lainnya, atau muat SVG custom.<br><b>Polygon:</b> klik titik-titik lalu double-click untuk selesai.<br><b>Simpan:</b> geometri yang selesai otomatis disimpan jika lokasi file dipilih. Setelah Buat Layer, geometri berikutnya selalu kembali ke Temporary Layer.")
         m=QMessageBox(self);m.setWindowTitle(title);m.setTextFormat(Qt.RichText);m.setText(text);m.setStandardButtons(QMB_OK);m.exec()
     def _show_about(self):AboutDialog(self.lang,self.VERSION,self).exec()

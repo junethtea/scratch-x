@@ -4,7 +4,7 @@
 
 Scratch-X is a free QGIS plugin for quickly creating **Line, LineString routes, Point, Polygon, and customizable Shapes** directly on the QGIS map canvas, with live measurements, flexible styling, categorized symbols, and multiple export formats.
 
-> **Current version: 2.1.2**
+> **Current version: 2.1.3**
 
 ---
 
@@ -29,6 +29,16 @@ Scratch-X is a free QGIS plugin for quickly creating **Line, LineString routes, 
 
 ---
 
+## What's New in v2.1.3
+
+- **Automatic edge-pan while drawing** — the map automatically moves when the cursor reaches the canvas edge, allowing continuous drawing without switching to the QGIS Pan/Hand tool.
+- **Edge-pan works while Scratch-X is minimized** — the active drawing session remains available while the floating window is minimized.
+- **Automatic file saving** — when a File Path is selected, each completed geometry is written to the selected datasource automatically. Manual **Save Layer Edits** is not required.
+- **Expanded attribute information** — saved features include geometry-related values such as longitude, latitude, distance, radius, or area where applicable.
+- **Automatic layer-name labeling** — generated layers can display their layer name directly on the map using compact black text with a yellow buffer.
+- **Improved Point labeling** — Point labels are positioned above the point symbol so the symbol remains visible.
+
+---
 
 <p align="center">
   <a href="https://github.com/junethtea/scratch-x"><strong>View Source Code & Repository</strong></a>
@@ -178,41 +188,59 @@ Custom symbol selections are persisted between sessions.
 
 ## Measurement Tools
 
-Scratch-X provides live measurements while geometry is being created.
+Scratch-X provides live measurements while geometry is being created. Saved metric values use **meters** for linear measurements and **square meters** for area.
 
-| Geometry | Measurement |
-|---|---|
-| Line | Segment distance |
-| LineString | Route distance |
-| Polygon | Area |
-| Circle | Radius |
+| Geometry | Measurement | Unit |
+|---|---|---|
+| Line | Segment distance | m |
+| LineString | Route distance | m |
+| Polygon | Area | m² |
+| Circle | Radius | m |
 
 Measurements are calculated using QGIS geometry/measurement functionality rather than relying on a simple screen-pixel approximation.
+
+### Attribute Information
+
+Saved Scratch-X features include a compact attribute table with geometry-related information. The available metric field depends on the geometry type:
+
+| Field | Description |
+|---|---|
+| `id` | Feature ID |
+| `name` | Layer/file name |
+| `longitude` | Longitude in WGS84 |
+| `latitude` | Latitude in WGS84 |
+| `distance` | Line / LineString length in meters |
+| `radius` | Circle radius in meters |
+| `area` | Polygon / Shape area in square meters |
+| `notes` | Optional notes field |
 
 ---
 
 ## Save Geometry
 
-Scratch-X separates **geometry creation** from the decision to save it.
+Scratch-X supports two save modes: **Temporary Layer** and **File Path**.
 
 ### Temporary Layer
 
-For a temporary geometry, leave:
+If File Path is left as:
 
-`File Path → Temporary Layer`
+`Temporary Layer`
 
-Then click **Create Layer** and draw directly on the QGIS canvas.
+Scratch-X creates a QGIS memory layer. The geometry remains part of the current QGIS project and is not automatically written to a file.
 
 ### Save to File
 
-To save the next geometry:
+When a File Path is selected before **Create Layer**:
 
 1. Select the output format.
 2. Click the folder button.
-3. Select the destination.
+3. Select the destination file.
 4. Click **Create Layer**.
 5. Draw the geometry.
-6. Finish the QGIS editing operation to write the geometry to the selected file.
+6. Finish the geometry.
+7. Scratch-X automatically saves the completed geometry to the selected file.
+
+Manual **Save Layer Edits** from the QGIS layer context menu is not required.
 
 Supported formats:
 
@@ -223,15 +251,13 @@ Supported formats:
 | Keyhole Markup Language | `.kml` |
 | GeoJSON | `.geojson` |
 
-### Important Save Behavior
+### Save Behavior
 
-The output path is intentionally **not carried over to the next geometry**.
-
-After creating a layer, Scratch-X returns the next operation to:
+Each completed geometry is automatically written to the selected datasource. The output path is intentionally **not carried over to the next geometry**. After **Create Layer**, Scratch-X resets the next operation to:
 
 `Temporary Layer`
 
-This prevents an old file path from accidentally being reused for a new geometry.
+This prevents an old file path from accidentally becoming the destination for a new geometry.
 
 ---
 
@@ -264,6 +290,17 @@ Point 1
 
 ---
 
+## Automatic Layer Labels
+
+Scratch-X automatically applies a compact layer-name label to created geometry.
+
+- Label text uses the layer/file name.
+- Text color: **black**.
+- Text buffer: **yellow**.
+- No rectangular label background is used.
+- Point labels are positioned above the point symbol so the symbol remains visible.
+- Line, Polygon, and Shape labels are positioned around the geometry center where supported by QGIS labeling.
+
 ## Persistent Settings
 
 Scratch-X remembers user preferences between sessions, including:
@@ -287,6 +324,17 @@ The **output File Path is intentionally not persisted**.
 This keeps a previously selected save location from becoming an accidental destination for a future geometry.
 
 ---
+
+## Automatic Map Edge-Pan
+
+While drawing a multi-step geometry, move the cursor toward the edge of the QGIS map canvas. Scratch-X automatically pans the map so drawing can continue without switching to the Hand/Pan tool.
+
+- Left edge → map moves left
+- Right edge → map moves right
+- Top edge → map moves downward
+- Bottom edge → map moves upward
+
+The active drawing session remains available even when the Scratch-X floating window is minimized.
 
 ## Keyboard
 
@@ -373,6 +421,8 @@ Create Layer
 Draw on QGIS Canvas
       ↓
 Finish / Cancel with ESC
+      ↓
+Auto-save when a File Path is selected
 ```
 
 ---
